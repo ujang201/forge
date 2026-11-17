@@ -18,9 +18,31 @@
 
 import { createApp } from './app.ts';
 
+/** Forge's own version, printed by --version and in the startup banner. */
+const FORGE_VERSION = '1.0.0';
+
+/** Print the version and leave: no env, no server, no registration. */
+if (process.argv.includes('--version')) {
+  process.stdout.write(`forge ${FORGE_VERSION} (node ${process.version})\n`);
+  process.exit(0);
+}
+
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
+  process.exit(1);
+}
+
+/** The env origin, parsed once so a malformed MAKEFUN_ENV_URL fails loudly up front. */
+let ENV_ORIGIN: URL;
+try {
+  ENV_ORIGIN = new URL(ENV_URL);
+} catch {
+  process.stderr.write(`[entry] MAKEFUN_ENV_URL is not a URL: ${JSON.stringify(ENV_URL)}\n`);
+  process.exit(1);
+}
+if (ENV_ORIGIN.protocol !== 'http:' && ENV_ORIGIN.protocol !== 'https:') {
+  process.stderr.write(`[entry] MAKEFUN_ENV_URL must be http(s), got ${ENV_ORIGIN.protocol}\n`);
   process.exit(1);
 }
 
@@ -76,6 +98,26 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+/** True once a shutdown signal has been handled; a second signal does nothing. */
+let shuttingDown = false;
+
+/**
+ * Close the bound server when the harness stops the process, then leave cleanly. The server
+ * is closed first so in-flight git pushes finish their reply; the fallback timer bounds the
+ * wait so a dangling keep-alive connection cannot hang the shutdown.
+ */
+function installSignalHandlers(server: ReturnType<typeof createApp>): void {
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    process.stdout.write(`[entry] ${signal} received; closing the server\n`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5_000).unref();
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
+}
+
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
@@ -86,6 +128,9 @@ async function main(): Promise<void> {
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  process.stdout.write(`[entry] forge ${FORGE_VERSION} on node ${process.version} — env ${ENV_ORIGIN.host}\n`);
+  process.stdout.write('[entry] surfaces: git smart HTTP, REST v3, GraphQL, MCP\n');
+  installSignalHandlers(server);
 
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
